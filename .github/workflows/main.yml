@@ -1,0 +1,219 @@
+name: PR Code Coverage Check
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  coverage-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for accurate diff
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install coverage pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e .; fi
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v40
+        with:
+          files: |
+            **/*.py
+          files_ignore: |
+            **/test_*.py
+            **/*_test.py
+            **/tests/**
+            **/test/**
+            **/__pycache__/**
+            **/.*
+            setup.py
+            conftest.py
+
+      - name: Run tests with coverage for changed files
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          # Create coverage directory
+          mkdir -p coverage
+          
+          # Convert changed files to coverage include pattern
+          CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          
+          # Create coverage config for specific files
+          echo "[run]" > .coveragerc
+          echo "source = ." >> .coveragerc
+          echo "include =" >> .coveragerc
+          
+          # Add each changed file to coverage include
+          for file in $CHANGED_FILES; do
+            echo "    $file" >> .coveragerc
+          done
+          
+          echo "" >> .coveragerc
+          echo "[report]" >> .coveragerc
+          echo "exclude_lines =" >> .coveragerc
+          echo "    pragma: no cover" >> .coveragerc
+          echo "    def __repr__" >> .coveragerc
+          echo "    if self.debug:" >> .coveragerc
+          echo "    if settings.DEBUG" >> .coveragerc
+          echo "    raise AssertionError" >> .coveragerc
+          echo "    raise NotImplementedError" >> .coveragerc
+          echo "    if 0:" >> .coveragerc
+          echo "    if __name__ == .__main__.:" >> .coveragerc
+          echo "" >> .coveragerc
+          echo "[json]" >> .coveragerc
+          echo "output = coverage/coverage.json" >> .coveragerc
+          
+          # Run tests with coverage
+          coverage run -m pytest -v
+          coverage json
+          coverage report
+
+      - name: Check coverage threshold
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          #!/bin/bash
+          
+          COVERAGE_FILE="coverage/coverage.json"
+          THRESHOLD=80
+          
+          if [ ! -f "$COVERAGE_FILE" ]; then
+            echo "❌ Coverage file not found: $COVERAGE_FILE"
+            exit 1
+          fi
+          
+          # Install jq for JSON parsing
+          sudo apt-get update && sudo apt-get install -y jq bc
+          
+          # Extract coverage percentages using jq
+          LINES_COVERED=$(jq '.totals.covered_lines' "$COVERAGE_FILE")
+          LINES_TOTAL=$(jq '.totals.num_statements' "$COVERAGE_FILE")
+          BRANCHES_COVERED=$(jq '.totals.covered_branches // 0' "$COVERAGE_FILE")
+          BRANCHES_TOTAL=$(jq '.totals.num_branches // 1' "$COVERAGE_FILE")
+          MISSING_LINES=$(jq '.totals.missing_lines' "$COVERAGE_FILE")
+          
+          # Calculate percentages
+          if [ "$LINES_TOTAL" -gt 0 ]; then
+            LINES_COVERAGE=$(echo "scale=2; $LINES_COVERED * 100 / $LINES_TOTAL" | bc)
+          else
+            LINES_COVERAGE=100
+          fi
+          
+          if [ "$BRANCHES_TOTAL" -gt 0 ]; then
+            BRANCHES_COVERAGE=$(echo "scale=2; $BRANCHES_COVERED * 100 / $BRANCHES_TOTAL" | bc)
+          else
+            BRANCHES_COVERAGE=100
+          fi
+          
+          echo "📊 Coverage Report for Changed Files:"
+          echo "Lines: ${LINES_COVERAGE}% (${LINES_COVERED}/${LINES_TOTAL})"
+          echo "Branches: ${BRANCHES_COVERAGE}% (${BRANCHES_COVERED}/${BRANCHES_TOTAL})"
+          echo "Missing Lines: ${MISSING_LINES}"
+          echo "Threshold: ${THRESHOLD}%"
+          echo ""
+          
+          # Check if coverage is below threshold
+          FAILED=false
+          
+          if (( $(echo "$LINES_COVERAGE < $THRESHOLD" | bc -l) )); then
+            echo "❌ Line coverage (${LINES_COVERAGE}%) is below threshold (${THRESHOLD}%)"
+            FAILED=true
+          fi
+          
+          if (( $(echo "$BRANCHES_COVERAGE < $THRESHOLD" | bc -l) )); then
+            echo "❌ Branch coverage (${BRANCHES_COVERAGE}%) is below threshold (${THRESHOLD}%)"
+            FAILED=true
+          fi
+          
+          if [ "$FAILED" = true ]; then
+            echo ""
+            echo "💡 Please add more unit tests to increase coverage above ${THRESHOLD}%."
+            echo ""
+            echo "Files with missing coverage:"
+            jq -r '.files | to_entries[] | select(.value.summary.percent_covered < 80) | "  - \(.key): \(.value.summary.percent_covered)% covered"' "$COVERAGE_FILE"
+            exit 1
+          else
+            echo "✅ All coverage metrics meet the ${THRESHOLD}% threshold!"
+          fi
+
+      - name: Comment coverage results on PR
+        if: always() && steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const coverageFile = 'coverage/coverage.json';
+            
+            if (!fs.existsSync(coverageFile)) {
+              return;
+            }
+            
+            const coverage = JSON.parse(fs.readFileSync(coverageFile, 'utf8'));
+            const totals = coverage.totals;
+            
+            // Calculate percentages
+            const linesPct = totals.num_statements > 0 ? 
+              Math.round((totals.covered_lines / totals.num_statements) * 100 * 100) / 100 : 100;
+            const branchesPct = totals.num_branches > 0 ? 
+              Math.round((totals.covered_branches / totals.num_branches) * 100 * 100) / 100 : 100;
+            
+            // Get individual file coverage
+            let fileDetails = '';
+            Object.entries(coverage.files).forEach(([file, data]) => {
+              const filePct = data.summary.percent_covered;
+              const status = filePct >= 80 ? '✅' : '❌';
+              fileDetails += `| ${file} | ${filePct}% | ${status} |\n`;
+            });
+            
+            const coverageComment = `
+            ## 📊 Python Code Coverage Report
+            
+            ### Overall Coverage
+            | Metric | Coverage | Threshold | Status |
+            |--------|----------|-----------|---------|
+            | Lines | ${linesPct}% | 80% | ${linesPct >= 80 ? '✅' : '❌'} |
+            | Branches | ${branchesPct}% | 80% | ${branchesPct >= 80 ? '✅' : '❌'} |
+            
+            ### File-by-File Coverage
+            | File | Coverage | Status |
+            |------|----------|--------|
+            ${fileDetails}
+            
+            ${linesPct >= 80 && branchesPct >= 80 
+              ? '🎉 All coverage thresholds met!' 
+              : '⚠️ Some coverage thresholds not met. Please add more tests.'}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: coverageComment
+            });
+
+      - name: Upload coverage reports
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: coverage/
+
+      - name: No changes detected
+        if: steps.changed-files.outputs.any_changed != 'true'
+        run: |
+          echo "ℹ️ No relevant code changes detected. Skipping coverage check."
