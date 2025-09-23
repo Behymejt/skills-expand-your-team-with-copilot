@@ -25,9 +25,26 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install coverage pytest
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          if [ -f pyproject.toml ]; then pip install -e .; fi
+          
+          # Install project dependencies in order of preference
+          if [ -f requirements-dev.txt ]; then 
+            echo "📦 Installing from requirements-dev.txt"
+            pip install -r requirements-dev.txt
+          elif [ -f requirements.txt ]; then 
+            echo "📦 Installing from requirements.txt"
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then 
+            echo "📦 Installing from pyproject.toml"
+            pip install -e .
+          else
+            echo "⚠️ No requirements file found, installing only coverage and pytest"
+          fi
+          
+          # Install the project in development mode if setup.py exists
+          if [ -f setup.py ]; then
+            echo "📦 Installing project in development mode"
+            pip install -e .
+          fi
 
       - name: Get changed files
         id: changed-files
@@ -51,12 +68,21 @@ jobs:
           # Create coverage directory
           mkdir -p coverage
           
+          # Check if tests exist
+          if ! find . -name "test_*.py" -o -name "*_test.py" -o -path "*/tests/*" -name "*.py" | grep -q .; then
+            echo "❌ No test files found!"
+            echo "Please create test files with naming patterns:"
+            echo "  - test_*.py"
+            echo "  - *_test.py" 
+            echo "  - files in tests/ directory"
+            exit 1
+          fi
+          
           # Convert changed files to coverage include pattern
           CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
           
-          # Create coverage config for specific files
+          # Create coverage config for specific files (use include only, not source)
           echo "[run]" > .coveragerc
-          echo "source = ." >> .coveragerc
           echo "include =" >> .coveragerc
           
           # Add each changed file to coverage include
@@ -79,10 +105,26 @@ jobs:
           echo "[json]" >> .coveragerc
           echo "output = coverage/coverage.json" >> .coveragerc
           
+          echo "📋 Coverage config (.coveragerc):"
+          cat .coveragerc
+          echo ""
+          
+          echo "📂 Changed files to analyze:"
+          echo "$CHANGED_FILES"
+          echo ""
+          
+          echo "🧪 Discovering tests..."
+          python -m pytest --collect-only -q
+          echo ""
+          
           # Run tests with coverage
-          coverage run -m pytest -v
+          echo "🚀 Running tests with coverage..."
+          coverage run -m pytest -v --tb=short
+          
+          # Generate reports
+          echo "📊 Generating coverage reports..."
           coverage json
-          coverage report
+          coverage report --show-missing
 
       - name: Check coverage threshold
         if: steps.changed-files.outputs.any_changed == 'true'
@@ -94,25 +136,52 @@ jobs:
           
           if [ ! -f "$COVERAGE_FILE" ]; then
             echo "❌ Coverage file not found: $COVERAGE_FILE"
+            echo "This usually means no tests were run or no coverage data was collected."
+            echo ""
+            echo "🔍 Troubleshooting steps:"
+            echo "1. Ensure test files exist with proper naming (test_*.py or *_test.py)"
+            echo "2. Check if tests are discoverable by pytest"
+            echo "3. Verify changed files are actual Python modules (not just scripts)"
             exit 1
           fi
           
           # Install jq for JSON parsing
           sudo apt-get update && sudo apt-get install -y jq bc
           
+          # Check if coverage.json has data
+          if ! jq -e '.totals' "$COVERAGE_FILE" > /dev/null 2>&1; then
+            echo "❌ No coverage data found in $COVERAGE_FILE"
+            echo "This typically means:"
+            echo "1. No tests were executed"
+            echo "2. The changed files were not imported/executed during tests"
+            echo "3. All changed files were excluded from coverage"
+            echo ""
+            echo "📝 Coverage file contents:"
+            cat "$COVERAGE_FILE"
+            exit 1
+          fi
+          
           # Extract coverage percentages using jq
-          LINES_COVERED=$(jq '.totals.covered_lines' "$COVERAGE_FILE")
-          LINES_TOTAL=$(jq '.totals.num_statements' "$COVERAGE_FILE")
+          LINES_COVERED=$(jq '.totals.covered_lines // 0' "$COVERAGE_FILE")
+          LINES_TOTAL=$(jq '.totals.num_statements // 0' "$COVERAGE_FILE")
           BRANCHES_COVERED=$(jq '.totals.covered_branches // 0' "$COVERAGE_FILE")
-          BRANCHES_TOTAL=$(jq '.totals.num_branches // 1' "$COVERAGE_FILE")
-          MISSING_LINES=$(jq '.totals.missing_lines' "$COVERAGE_FILE")
+          BRANCHES_TOTAL=$(jq '.totals.num_branches // 0' "$COVERAGE_FILE")
+          MISSING_LINES=$(jq '.totals.missing_lines // 0' "$COVERAGE_FILE")
+          
+          # Handle case where no statements to cover
+          if [ "$LINES_TOTAL" -eq 0 ]; then
+            echo "⚠️ No executable statements found in changed files"
+            echo "This could mean:"
+            echo "1. Changed files contain only comments/docstrings"
+            echo "2. Changed files are not Python modules"
+            echo "3. Files were not properly included in coverage analysis"
+            echo ""
+            echo "✅ Skipping coverage check (no code to test)"
+            exit 0
+          fi
           
           # Calculate percentages
-          if [ "$LINES_TOTAL" -gt 0 ]; then
-            LINES_COVERAGE=$(echo "scale=2; $LINES_COVERED * 100 / $LINES_TOTAL" | bc)
-          else
-            LINES_COVERAGE=100
-          fi
+          LINES_COVERAGE=$(echo "scale=2; $LINES_COVERED * 100 / $LINES_TOTAL" | bc)
           
           if [ "$BRANCHES_TOTAL" -gt 0 ]; then
             BRANCHES_COVERAGE=$(echo "scale=2; $BRANCHES_COVERED * 100 / $BRANCHES_TOTAL" | bc)
@@ -135,7 +204,7 @@ jobs:
             FAILED=true
           fi
           
-          if (( $(echo "$BRANCHES_COVERAGE < $THRESHOLD" | bc -l) )); then
+          if [ "$BRANCHES_TOTAL" -gt 0 ] && (( $(echo "$BRANCHES_COVERAGE < $THRESHOLD" | bc -l) )); then
             echo "❌ Branch coverage (${BRANCHES_COVERAGE}%) is below threshold (${THRESHOLD}%)"
             FAILED=true
           fi
@@ -144,8 +213,8 @@ jobs:
             echo ""
             echo "💡 Please add more unit tests to increase coverage above ${THRESHOLD}%."
             echo ""
-            echo "Files with missing coverage:"
-            jq -r '.files | to_entries[] | select(.value.summary.percent_covered < 80) | "  - \(.key): \(.value.summary.percent_covered)% covered"' "$COVERAGE_FILE"
+            echo "📁 Files with missing coverage:"
+            jq -r '.files | to_entries[] | select(.value.summary.percent_covered < 80) | "  - \(.key): \(.value.summary.percent_covered)% covered"' "$COVERAGE_FILE" || echo "  (Unable to parse individual file coverage)"
             exit 1
           else
             echo "✅ All coverage metrics meet the ${THRESHOLD}% threshold!"
