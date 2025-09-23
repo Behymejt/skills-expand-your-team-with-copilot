@@ -4,7 +4,7 @@ Authentication endpoints for the High School Management System API
 
 from fastapi import APIRouter, HTTPException
 from typing import Dict, Any
-import hashlib
+from argon2 import PasswordHasher
 
 from ..database import teachers_collection
 
@@ -13,9 +13,21 @@ router = APIRouter(
     tags=["auth"]
 )
 
+ph = PasswordHasher()
+
 def hash_password(password):
-    """Hash password using SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash password using Argon2"""
+    return ph.hash(password)
+
+def verify_password(stored_hash, input_password):
+    """
+    Verify if the input_password matches the stored Argon2 hash.
+    Returns True if correct, False otherwise.
+    """
+    try:
+        return ph.verify(stored_hash, input_password)
+    except Exception:
+        return False
 
 @router.post("/login")
 def login(username: str, password: str) -> Dict[str, Any]:
@@ -26,7 +38,7 @@ def login(username: str, password: str) -> Dict[str, Any]:
     # Find the teacher in the database
     teacher = teachers_collection.find_one({"_id": username})
     
-    if not teacher or teacher["password"] != hashed_password:
+    if not teacher or not verify_password(teacher["password"], password):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     
     # Return teacher information (excluding password)
